@@ -38,31 +38,45 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 def load_model(model_name: str = "BinhQuocNguyen/food-recognition-model"):
     print(f"Loading model: {model_name}")
 
-    # Try loading processor — the model may not include a preprocessor_config.json,
-    # so fall back through several options until one works.
+    # The model uses a custom architecture registered as 'food_recognition'.
+    # trust_remote_code=True downloads and executes the model code from the repo.
     processor = None
     for loader in [AutoImageProcessor, AutoFeatureExtractor]:
-        try:
-            processor = loader.from_pretrained(model_name)
+        for trust in [True, False]:
+            try:
+                processor = loader.from_pretrained(model_name, trust_remote_code=trust)
+                break
+            except Exception:
+                continue
+        if processor is not None:
             break
-        except Exception:
-            continue
 
     if processor is None:
-        # Last resort: use a standard ViT processor (224x224, ImageNet normalisation)
-        print("  No processor config found in model — using default ViT processor (224px, ImageNet stats)")
+        print("  No processor config found — using default ViT processor (224px, ImageNet stats)")
         processor = ViTImageProcessor(
             size={"height": 224, "width": 224},
             image_mean=[0.485, 0.456, 0.406],
             image_std=[0.229, 0.224, 0.225],
         )
 
-    model = AutoModelForImageClassification.from_pretrained(model_name)
+    model = AutoModelForImageClassification.from_pretrained(
+        model_name, trust_remote_code=True
+    )
     model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     print(f"Model loaded. Running on: {device}\n")
     return model, processor, device
+
+
+def resolve_label(model, idx: int) -> str:
+    """Get label name from model's id2label if available, else our hardcoded list."""
+    id2label = getattr(model.config, "id2label", None)
+    if id2label and idx in id2label:
+        return id2label[idx]
+    if idx < len(FOOD11_LABELS):
+        return FOOD11_LABELS[idx]
+    return f"Class {idx}"
 
 
 def predict_image(image_path: Path, model, processor, device):
@@ -72,10 +86,11 @@ def predict_image(image_path: Path, model, processor, device):
 
     with torch.no_grad():
         outputs = model(**inputs)
-        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+        probs = torch.nn.functional.softmax(logits, dim=-1)[0]
 
     top_prob, top_idx = probs.max(dim=0)
-    label = FOOD11_LABELS[top_idx.item()] if top_idx.item() < len(FOOD11_LABELS) else f"Class {top_idx.item()}"
+    label = resolve_label(model, top_idx.item())
     return label, top_prob.item()
 
 
