@@ -1,22 +1,12 @@
 import csv
-import json
 import os
 import torch
 import argparse
 from pathlib import Path
 from PIL import Image
-from transformers import (
-    AutoImageProcessor,
-    AutoFeatureExtractor,
-    ViTImageProcessor,
-    ViTForImageClassification,
-    EfficientNetForImageClassification,
-    ResNetForImageClassification,
-    ConvNextForImageClassification,
-    SwinForImageClassification,
-)
+from transformers import CLIPProcessor, CLIPModel
 
-# Food-11 class labels (indices 0-10)
+# Food-11 class labels
 FOOD11_LABELS = [
     "Bread",
     "Dairy product",
@@ -31,6 +21,9 @@ FOOD11_LABELS = [
     "Vegetable/Fruit",
 ]
 
+# CLIP performs better with descriptive prompts
+CLIP_PROMPTS = [f"a photo of {label.lower()}" for label in FOOD11_LABELS]
+
 # Map folder names (with hyphens) to canonical label names
 FOLDER_NAME_MAP = {
     "Noodles-Pasta": "Noodles/Pasta",
@@ -39,128 +32,36 @@ FOLDER_NAME_MAP = {
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# Known architecture classes to try if AutoModel fails
-KNOWN_ARCHITECTURES = [
-    ViTForImageClassification,
-    EfficientNetForImageClassification,
-    ResNetForImageClassification,
-    ConvNextForImageClassification,
-    SwinForImageClassification,
-]
-
-# Map architecture name strings (from config.json) to classes
-ARCH_NAME_MAP = {
-    "ViTForImageClassification": ViTForImageClassification,
-    "EfficientNetForImageClassification": EfficientNetForImageClassification,
-    "ResNetForImageClassification": ResNetForImageClassification,
-    "ConvNextForImageClassification": ConvNextForImageClassification,
-    "SwinForImageClassification": SwinForImageClassification,
-}
+MODEL_NAME = "openai/clip-vit-base-patch32"
 
 
-def fetch_raw_config(model_name: str) -> dict:
-    """Download and return the model's raw config.json as a dict."""
-    try:
-        from huggingface_hub import hf_hub_download
-        config_path = hf_hub_download(repo_id=model_name, filename="config.json")
-        with open(config_path) as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"  Warning: could not fetch raw config — {e}")
-        return {}
-
-
-def load_processor(model_name: str):
-    for loader in [AutoImageProcessor, AutoFeatureExtractor]:
-        try:
-            return loader.from_pretrained(model_name)
-        except Exception:
-            continue
-    print("  No processor config found — using default ViT processor (224px, ImageNet stats)")
-    return ViTImageProcessor(
-        size={"height": 224, "width": 224},
-        image_mean=[0.485, 0.456, 0.406],
-        image_std=[0.229, 0.224, 0.225],
-    )
-
-
-def load_model(model_name: str = "BinhQuocNguyen/food-recognition-model"):
-    print(f"Loading model: {model_name}")
-
-    # Read the raw config to discover the real backbone architecture
-    raw_config = fetch_raw_config(model_name)
-    model_type = raw_config.get("model_type", "unknown")
-    arch_names = raw_config.get("architectures", [])
-    print(f"  Config model_type : {model_type}")
-    print(f"  Config architectures: {arch_names}")
-
-    processor = load_processor(model_name)
-
-    model = None
-
-    # 1. If the config lists a known architecture class name, try that first
-    for arch_name in arch_names:
-        if arch_name in ARCH_NAME_MAP:
-            try:
-                model = ARCH_NAME_MAP[arch_name].from_pretrained(
-                    model_name, ignore_mismatched_sizes=True
-                )
-                print(f"  Loaded via config architecture: {arch_name}")
-                break
-            except Exception as e:
-                print(f"  {arch_name} failed: {e}")
-
-    # 2. Fall back: try each known architecture until one works
-    if model is None:
-        print("  Trying known architecture classes...")
-        for cls in KNOWN_ARCHITECTURES:
-            try:
-                model = cls.from_pretrained(model_name, ignore_mismatched_sizes=True)
-                print(f"  Loaded as {cls.__name__}")
-                break
-            except Exception:
-                continue
-
-    if model is None:
-        raise RuntimeError(
-            f"Could not load '{model_name}' with any known architecture.\n"
-            "The model may have an incomplete upload on HuggingFace. "
-            "Try a different model (e.g. 'nateraw/food')."
-        )
-
+def load_model():
+    print(f"Loading model: {MODEL_NAME}")
+    processor = CLIPProcessor.from_pretrained(MODEL_NAME)
+    model = CLIPModel.from_pretrained(MODEL_NAME)
     model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
-    print(f"  Running on: {device}\n")
+    print(f"Model loaded. Running on: {device}\n")
     return model, processor, device
-
-
-def resolve_label(model, idx: int) -> str:
-    """Get label name from model's id2label if available, else our hardcoded list."""
-    id2label = getattr(model.config, "id2label", None)
-    if id2label:
-        # id2label keys can be ints or strings
-        label = id2label.get(idx) or id2label.get(str(idx))
-        if label:
-            return label
-    if idx < len(FOOD11_LABELS):
-        return FOOD11_LABELS[idx]
-    return f"Class {idx}"
 
 
 def predict_image(image_path: Path, model, processor, device):
     image = Image.open(image_path).convert("RGB")
-    inputs = processor(images=image, return_tensors="pt")
+    inputs = processor(
+        text=CLIP_PROMPTS,
+        images=image,
+        return_tensors="pt",
+        padding=True,
+    )
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
         outputs = model(**inputs)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-        probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+        probs = outputs.logits_per_image.softmax(dim=-1)[0]
 
     top_prob, top_idx = probs.max(dim=0)
-    label = resolve_label(model, top_idx.item())
-    return label, top_prob.item()
+    return FOOD11_LABELS[top_idx.item()], top_prob.item()
 
 
 def resolve_ground_truth(folder_name: str):
@@ -253,7 +154,9 @@ def run(folder: str, output_csv: str = "results.csv", max_images: int = None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Food-11 recognition using HuggingFace model")
+    parser = argparse.ArgumentParser(
+        description="Food-11 recognition using CLIP zero-shot classification"
+    )
     parser.add_argument("folder", help="Path to evaluation folder (with per-class subfolders)")
     parser.add_argument("--output", default="results.csv", help="Output CSV file path (default: results.csv)")
     parser.add_argument("--max-images", type=int, default=None, help="Limit number of images processed")
