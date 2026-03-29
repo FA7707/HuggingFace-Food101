@@ -4,7 +4,12 @@ import torch
 import argparse
 from pathlib import Path
 from PIL import Image
-from transformers import AutoModel, AutoImageProcessor
+from transformers import (
+    AutoModelForImageClassification,
+    AutoImageProcessor,
+    AutoFeatureExtractor,
+    ViTImageProcessor,
+)
 
 # Food-11 class labels (indices 0-10)
 FOOD11_LABELS = [
@@ -32,8 +37,27 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 def load_model(model_name: str = "BinhQuocNguyen/food-recognition-model"):
     print(f"Loading model: {model_name}")
-    processor = AutoImageProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
+
+    # Try loading processor — the model may not include a preprocessor_config.json,
+    # so fall back through several options until one works.
+    processor = None
+    for loader in [AutoImageProcessor, AutoFeatureExtractor]:
+        try:
+            processor = loader.from_pretrained(model_name)
+            break
+        except Exception:
+            continue
+
+    if processor is None:
+        # Last resort: use a standard ViT processor (224x224, ImageNet normalisation)
+        print("  No processor config found in model — using default ViT processor (224px, ImageNet stats)")
+        processor = ViTImageProcessor(
+            size={"height": 224, "width": 224},
+            image_mean=[0.485, 0.456, 0.406],
+            image_std=[0.229, 0.224, 0.225],
+        )
+
+    model = AutoModelForImageClassification.from_pretrained(model_name)
     model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
