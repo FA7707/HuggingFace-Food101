@@ -1,14 +1,19 @@
 import csv
+import json
 import os
 import torch
 import argparse
 from pathlib import Path
 from PIL import Image
 from transformers import (
-    AutoModelForImageClassification,
     AutoImageProcessor,
     AutoFeatureExtractor,
     ViTImageProcessor,
+    ViTForImageClassification,
+    EfficientNetForImageClassification,
+    ResNetForImageClassification,
+    ConvNextForImageClassification,
+    SwinForImageClassification,
 )
 
 # Food-11 class labels (indices 0-10)
@@ -34,46 +39,110 @@ FOLDER_NAME_MAP = {
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+# Known architecture classes to try if AutoModel fails
+KNOWN_ARCHITECTURES = [
+    ViTForImageClassification,
+    EfficientNetForImageClassification,
+    ResNetForImageClassification,
+    ConvNextForImageClassification,
+    SwinForImageClassification,
+]
+
+# Map architecture name strings (from config.json) to classes
+ARCH_NAME_MAP = {
+    "ViTForImageClassification": ViTForImageClassification,
+    "EfficientNetForImageClassification": EfficientNetForImageClassification,
+    "ResNetForImageClassification": ResNetForImageClassification,
+    "ConvNextForImageClassification": ConvNextForImageClassification,
+    "SwinForImageClassification": SwinForImageClassification,
+}
+
+
+def fetch_raw_config(model_name: str) -> dict:
+    """Download and return the model's raw config.json as a dict."""
+    try:
+        from huggingface_hub import hf_hub_download
+        config_path = hf_hub_download(repo_id=model_name, filename="config.json")
+        with open(config_path) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"  Warning: could not fetch raw config — {e}")
+        return {}
+
+
+def load_processor(model_name: str):
+    for loader in [AutoImageProcessor, AutoFeatureExtractor]:
+        try:
+            return loader.from_pretrained(model_name)
+        except Exception:
+            continue
+    print("  No processor config found — using default ViT processor (224px, ImageNet stats)")
+    return ViTImageProcessor(
+        size={"height": 224, "width": 224},
+        image_mean=[0.485, 0.456, 0.406],
+        image_std=[0.229, 0.224, 0.225],
+    )
+
 
 def load_model(model_name: str = "BinhQuocNguyen/food-recognition-model"):
     print(f"Loading model: {model_name}")
 
-    # The model uses a custom architecture registered as 'food_recognition'.
-    # trust_remote_code=True downloads and executes the model code from the repo.
-    processor = None
-    for loader in [AutoImageProcessor, AutoFeatureExtractor]:
-        for trust in [True, False]:
+    # Read the raw config to discover the real backbone architecture
+    raw_config = fetch_raw_config(model_name)
+    model_type = raw_config.get("model_type", "unknown")
+    arch_names = raw_config.get("architectures", [])
+    print(f"  Config model_type : {model_type}")
+    print(f"  Config architectures: {arch_names}")
+
+    processor = load_processor(model_name)
+
+    model = None
+
+    # 1. If the config lists a known architecture class name, try that first
+    for arch_name in arch_names:
+        if arch_name in ARCH_NAME_MAP:
             try:
-                processor = loader.from_pretrained(model_name, trust_remote_code=trust)
+                model = ARCH_NAME_MAP[arch_name].from_pretrained(
+                    model_name, ignore_mismatched_sizes=True
+                )
+                print(f"  Loaded via config architecture: {arch_name}")
+                break
+            except Exception as e:
+                print(f"  {arch_name} failed: {e}")
+
+    # 2. Fall back: try each known architecture until one works
+    if model is None:
+        print("  Trying known architecture classes...")
+        for cls in KNOWN_ARCHITECTURES:
+            try:
+                model = cls.from_pretrained(model_name, ignore_mismatched_sizes=True)
+                print(f"  Loaded as {cls.__name__}")
                 break
             except Exception:
                 continue
-        if processor is not None:
-            break
 
-    if processor is None:
-        print("  No processor config found — using default ViT processor (224px, ImageNet stats)")
-        processor = ViTImageProcessor(
-            size={"height": 224, "width": 224},
-            image_mean=[0.485, 0.456, 0.406],
-            image_std=[0.229, 0.224, 0.225],
+    if model is None:
+        raise RuntimeError(
+            f"Could not load '{model_name}' with any known architecture.\n"
+            "The model may have an incomplete upload on HuggingFace. "
+            "Try a different model (e.g. 'nateraw/food')."
         )
 
-    model = AutoModelForImageClassification.from_pretrained(
-        model_name, trust_remote_code=True
-    )
     model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
-    print(f"Model loaded. Running on: {device}\n")
+    print(f"  Running on: {device}\n")
     return model, processor, device
 
 
 def resolve_label(model, idx: int) -> str:
     """Get label name from model's id2label if available, else our hardcoded list."""
     id2label = getattr(model.config, "id2label", None)
-    if id2label and idx in id2label:
-        return id2label[idx]
+    if id2label:
+        # id2label keys can be ints or strings
+        label = id2label.get(idx) or id2label.get(str(idx))
+        if label:
+            return label
     if idx < len(FOOD11_LABELS):
         return FOOD11_LABELS[idx]
     return f"Class {idx}"
@@ -95,7 +164,6 @@ def predict_image(image_path: Path, model, processor, device):
 
 
 def resolve_ground_truth(folder_name: str):
-    """Map a subfolder name to a canonical Food-11 label, or None if unrecognised."""
     if folder_name in FOLDER_NAME_MAP:
         return FOLDER_NAME_MAP[folder_name]
     if folder_name in FOOD11_LABELS:
@@ -173,7 +241,6 @@ def run(folder: str, output_csv: str = "results.csv", max_images: int = None):
                 "correct": False,
             })
 
-    # Write CSV
     output_path = Path(output_csv)
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["image", "actual", "predicted", "confidence", "correct"])
